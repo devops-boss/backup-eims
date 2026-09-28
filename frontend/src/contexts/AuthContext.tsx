@@ -1,0 +1,248 @@
+import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import { AppUser } from '../types';
+import toast from 'react-hot-toast';
+import { authService } from '@/src/features/auth/services/authService';
+import { clearAuthToken, getAuthToken } from '@/src/lib/api';
+import { connectAccessSocket, connectSessionSocket } from '@/src/services/realtimeService';
+import { userCan, type Capability } from '@/src/lib/permissions';
+
+interface AuthContextType {
+  user: AppUser | null;
+  loading: boolean;
+  login: (email: string, pass: string) => Promise<{ requiresMfa?: boolean; mfaToken?: string }>;
+  loginMfa: (mfaToken: string, code: string) => Promise<void>;
+  resendLoginMfa: (mfaToken: string) => Promise<{ mfaToken: string }>;
+  register: (input: RegisterInput) => Promise<AppUser>;
+  refreshUser: () => Promise<AppUser | null>;
+  logout: () => Promise<void>;
+
+  can: (capability: Capability) => boolean;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+interface RegisterInput {
+  email: string;
+  password?: string;
+  fullName: string;
+  department: string;
+  site: string;
+}
+
+function toAppUser(apiUser: any): AppUser {
+  return {
+    uid: apiUser.id,
+    email: apiUser.email,
+    fullName: apiUser.fullName,
+    role: apiUser.role,
+    status: apiUser.status,
+    department: apiUser.department || 'Unassigned',
+    site: apiUser.site || 'Unassigned',
+    capabilities: Array.isArray(apiUser.capabilities) ? apiUser.capabilities : [],
+    capabilityOverrides: Array.isArray(apiUser.capabilityOverrides) ? apiUser.capabilityOverrides : null,
+    mfaEnabled: apiUser.mfaEnabled || false,
+
+  };
+}
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<AppUser | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const refreshUser = useCallback(async () => {
+    const token = getAuthToken();
+    if (!token) {
+      setUser(null);
+      return null;
+    }
+
+    try {
+      const apiUser = await authService.me();
+      const nextUser = toAppUser(apiUser);
+      setUser(nextUser);
+      return nextUser;
+    } catch (error: any) {
+      if (error?.status === 401 || error?.status === 403) {
+        clearAuthToken();
+        setUser(null);
+      }
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    async function bootstrapSession() {
+      await refreshUser();
+      setLoading(false);
+    }
+
+    bootstrapSession();
+  }, [refreshUser]);
+
+  useEffect(() => {
+    function syncCurrentUser() {
+      if (document.visibilityState === 'visible') {
+        refreshUser();
+      }
+    }
+
+    window.addEventListener('focus', syncCurrentUser);
+    document.addEventListener('visibilitychange', syncCurrentUser);
+    return () => {
+      window.removeEventListener('focus', syncCurrentUser);
+      document.removeEventListener('visibilitychange', syncCurrentUser);
+    };
+  }, [refreshUser]);
+
+
+
+  useEffect(() => {
+    if (!user?.uid) return undefined;
+
+    const cleanupAccess = connectAccessSocket({
+      onAccessUpdated: ({ user: apiUser }: { user?: any }) => {
+        if (!apiUser) return;
+
+        const nextUser = toAppUser(apiUser);
+        if (nextUser.status !== 'active') {
+          clearAuthToken();
+          setUser(null);
+          toast.error('Your account access changed. Please contact the Super Admin.');
+          return;
+        }
+
+        setUser(nextUser);
+        toast.success('Your account access was updated.');
+      },
+      onAccessRevoked: () => {
+        clearAuthToken();
+        setUser(null);
+        toast.error('Your account access was revoked.');
+      },
+    });
+
+    const cleanupSession = connectSessionSocket({
+      onOverride: () => {
+        clearAuthToken();
+        setUser(null);
+        toast.error('Someone logged in from another device. You have been logged out.');
+      }
+    });
+
+    return () => {
+      cleanupAccess();
+      cleanupSession();
+    };
+  }, [user?.uid]);
+
+  const login = async (email: string, pass: string) => {
+    try {
+      const apiUser = await authService.login(email, pass);
+      if (apiUser.requiresMfa) {
+        return { requiresMfa: true, mfaToken: apiUser.mfaToken };
+      }
+      setUser(toAppUser(apiUser));
+      toast.success('Successfully logged in');
+      return { requiresMfa: false };
+    } catch (error: any) {
+      const msg = error.message || 'Login failed';
+      if (!msg.toLowerCase().includes('pending') && !msg.toLowerCase().includes('disabled')) {
+        toast.error(msg);
+      }
+      throw error;
+    }
+  };
+
+  const loginMfa = async (mfaToken: string, code: string) => {
+    try {
+      const apiUser = await authService.loginMfa(mfaToken, code);
+      setUser(toAppUser(apiUser));
+      toast.success('Successfully logged in');
+    } catch (error: any) {
+      toast.error(error.message || 'Invalid MFA code');
+      throw error;
+    }
+  };
+
+  const resendLoginMfa = async (mfaToken: string) => {
+    return authService.resendLoginMfa(mfaToken);
+  };
+
+  const register = async (input: RegisterInput) => {
+    try {
+      const apiUser = await authService.register(input);
+      // Note: registration does not affect the current session. The caller is
+      // responsible for success messaging (the flow differs by context).
+      return toAppUser(apiUser);
+    } catch (error: any) {
+      toast.error(error.message || 'Registration failed');
+      throw error;
+    }
+  };
+
+  const logout = useCallback(async () => {
+    await authService.logout();
+    setUser(null);
+    toast.success('Logged out');
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+
+    let lastActivityTime = Date.now();
+    const INACTIVITY_LIMIT_MS = 30 * 60 * 1000; // 30 minutes
+
+    const handleUserActivity = () => {
+      lastActivityTime = Date.now();
+    };
+
+    const checkInactivity = setInterval(() => {
+      if (Date.now() - lastActivityTime > INACTIVITY_LIMIT_MS) {
+        logout();
+        toast.error('Logged out due to 30 minutes of inactivity');
+      }
+    }, 10000); // Check every 10 seconds
+
+    window.addEventListener('mousemove', handleUserActivity);
+    window.addEventListener('keydown', handleUserActivity);
+    window.addEventListener('scroll', handleUserActivity);
+    window.addEventListener('click', handleUserActivity);
+    window.addEventListener('touchstart', handleUserActivity);
+
+    return () => {
+      clearInterval(checkInactivity);
+      window.removeEventListener('mousemove', handleUserActivity);
+      window.removeEventListener('keydown', handleUserActivity);
+      window.removeEventListener('scroll', handleUserActivity);
+      window.removeEventListener('click', handleUserActivity);
+      window.removeEventListener('touchstart', handleUserActivity);
+    };
+  }, [user, logout]);
+
+  const value = React.useMemo(() => ({
+    user,
+    loading,
+    login,
+    loginMfa,
+    resendLoginMfa,
+    register,
+    refreshUser,
+    logout,
+
+    can: (capability: Capability) => userCan(user, capability),
+  }), [user, loading, refreshUser]);
+
+  return (
+    <AuthContext.Provider value={value}>
+      {!loading && children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+}

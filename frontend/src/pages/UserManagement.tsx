@@ -1,0 +1,1629 @@
+import { useEffect, useMemo, useState, useRef } from 'react';
+import type React from 'react';
+import { useNavigate } from 'react-router-dom';
+import { AlertTriangle, ArrowDown, ArrowUp, ArrowUpDown, Check, CheckCircle2, ChevronRight, ChevronDown, ChevronUp, Eye, EyeOff, Key, Loader2, Pencil, Search, ShieldCheck, SlidersHorizontal, Trash2, UserPlus, UserX, UsersRound, X } from 'lucide-react';
+import toast from 'react-hot-toast';
+import { PageLayout } from '@/src/components/layout/PageLayout';
+import { SkeletonLoadingMessage } from '@/src/components/SkeletonLoadingMessage';
+import { motion, AnimatePresence } from 'motion/react';
+import { USER_ACCOUNTS_REFRESHED_EVENT } from '@/src/components/layout/Header';
+import { AppUser, UserRole } from '@/src/types';
+import { userService } from '@/src/services/userService';
+import { authService } from '@/src/features/auth/services/authService';
+import { siteService } from '@/src/services/siteService';
+import RegisterForm from '@/src/features/auth/components/RegisterForm';
+import { roleService, type CapabilityItem, type Role } from '@/src/features/settings/services/roleService';
+import { RolesPanel } from '@/src/features/settings/components/RolesPanel';
+import { CapabilityChecklist } from '@/src/features/settings/components/CapabilityChecklist';
+import { useRealtimeSubscription } from '@/src/hooks/useRealtimeSubscription';
+import { useUsersQuery } from '@/src/hooks/queries';
+import { PASSWORD_RULES } from '@/src/lib/utils';
+
+const EDITABLE_ACCOUNT_STATUSES = [
+  { value: 'active' as const, label: 'Active' },
+  { value: 'disabled' as const, label: 'Disabled' },
+];
+
+type EditableAccountStatus = (typeof EDITABLE_ACCOUNT_STATUSES)[number]['value'];
+
+function ActionTooltip({ label }: { label: string }) {
+  return (
+    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-[9999] flex flex-col items-center translate-y-2 group-hover:translate-y-0 pointer-events-none">
+      <div className="bg-[#111827] text-white text-xs font-bold px-3 py-1.5 rounded-lg whitespace-nowrap shadow-xl">
+        {label}
+      </div>
+      <div className="w-0 h-0 border-x-4 border-x-transparent border-t-4 border-t-[#111827] mt-[-1px]"></div>
+    </div>
+  );
+}
+
+type UserEditDraft = {
+  department: string;
+  site: string;
+  role: UserRole;
+  status: EditableAccountStatus;
+};
+
+function asArray(value: any) {
+  return Array.isArray(value) ? value : [];
+}
+
+function roleLabel(role: string, rolesBySlug?: Map<string, Role>) {
+  if (rolesBySlug && rolesBySlug.has(role)) {
+    return rolesBySlug.get(role)!.name;
+  }
+  return role.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function statusClass(status: string) {
+  if (status === 'active') return 'bg-green-50 text-green-700';
+  if (status === 'pending') return 'bg-amber-50 text-amber-700';
+  return 'bg-red-50 text-red-700';
+}
+
+function statusLabel(status: string) {
+  return status;
+}
+
+function normalizeSiteNames(value: any) {
+  return asArray(value)
+    .map((site: any) => String(site?.name || '').trim())
+    .filter(Boolean);
+}
+
+function toEditDraft(user: AppUser): UserEditDraft {
+  const role: UserRole = user.role === 'super_admin' ? 'admin' : user.role;
+  const status: EditableAccountStatus = user.status === 'active' ? 'active' : 'disabled';
+
+  return {
+    department: user.department && user.department !== 'Unassigned' ? user.department : '',
+    site: user.site || '',
+    role,
+    status,
+  };
+}
+
+
+function getInitials(name: string, email: string) {
+  if (name) {
+    const parts = name.trim().split(' ').filter(Boolean);
+    if (parts.length > 1) {
+      return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+    }
+    if (parts.length === 1) {
+      return parts[0].substring(0, 2).toUpperCase();
+    }
+  }
+  return email.substring(0, 2).toUpperCase();
+}
+
+export default function UserManagement() {
+  const navigate = useNavigate();
+  const [users, setUsers] = useState<AppUser[]>([]);
+  const [search, setSearch] = useState('');
+  const [roleFilter, setRoleFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [sortConfig, setSortConfig] = useState<{ key: string; direction: 'asc' | 'desc' } | null>(null);
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 10;
+  const [isLoading, setIsLoading] = useState(true);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<UserEditDraft | null>(null);
+  const [departmentOptions, setDepartmentOptions] = useState<string[]>([]);
+  const [roles, setRoles] = useState<Role[]>([]);
+  const [siteOptions, setSiteOptions] = useState<string[]>([]);
+  const [disableUser, setDisableUser] = useState<AppUser | null>(null);
+  const [enableUser, setEnableUser] = useState<AppUser | null>(null);
+  const [showMissingDepartmentModal, setShowMissingDepartmentModal] = useState(false);
+  const [deleteUser, setDeleteUser] = useState<AppUser | null>(null);
+  const [deleteInput, setDeleteInput] = useState('');
+  const [showRegister, setShowRegister] = useState(false);
+  const [view, setView] = useState<'users' | 'roles'>('users');
+  const [capabilityCatalog, setCapabilityCatalog] = useState<CapabilityItem[]>([]);
+  const [permsTarget, setPermsTarget] = useState<AppUser | null>(null);
+  const [permsDraft, setPermsDraft] = useState<string[]>([]);
+  const [permsSaving, setPermsSaving] = useState(false);
+  const [passwordEditUser, setPasswordEditUser] = useState<AppUser | null>(null);
+  const [newPassword, setNewPassword] = useState('');
+  const [isUpdatingPassword, setIsUpdatingPassword] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const [refreshTrigger, setRefreshTrigger] = useState(0);
+  const [showAllRoles, setShowAllRoles] = useState(false);
+
+  const { data: fetchedUsers = [], isLoading: isUsersLoading } = useUsersQuery(refreshTrigger);
+
+  useRealtimeSubscription({
+    table: 'user_profiles',
+    onChange: () => setRefreshTrigger(prev => prev + 1)
+  });
+
+  useEffect(() => {
+    setUsers(fetchedUsers);
+    setIsLoading(isUsersLoading);
+  }, [fetchedUsers, isUsersLoading]);
+
+  useEffect(() => {
+    function syncRefreshedAccounts(event: Event) {
+      const accountList = (event as CustomEvent<{ users?: AppUser[] }>).detail?.users;
+      if (Array.isArray(accountList)) {
+        setUsers(accountList);
+        setIsLoading(false);
+      }
+    }
+
+    window.addEventListener(USER_ACCOUNTS_REFRESHED_EVENT, syncRefreshedAccounts);
+    return () => window.removeEventListener(USER_ACCOUNTS_REFRESHED_EVENT, syncRefreshedAccounts);
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadOptions() {
+      try {
+        const [departments, sites, roleList, catalog] = await Promise.all([
+          authService.internalDepartments(),
+          siteService.list(),
+          roleService.list(),
+          roleService.capabilities(),
+        ]);
+
+        if (!isMounted) return;
+
+        setRoles(asArray(roleList));
+        setCapabilityCatalog(asArray(catalog));
+        setDepartmentOptions(asArray(departments).map((name) => String(name).trim()).filter(Boolean));
+        const names = normalizeSiteNames(sites);
+        setSiteOptions(names.length ? names : ['HQ', 'Candelaria', 'WFH', 'Hybrid']);
+      } catch (error: any) {
+        if (isMounted) {
+          toast.error(error.message || 'Unable to load department and site options');
+        }
+      }
+    }
+
+    loadOptions();
+    return () => {
+      isMounted = false;
+    };
+  }, [view]);
+
+  const roleCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const r of roles) counts[r.slug] = 0;
+    for (const u of users) {
+      if (u.status === 'active' && u.role) {
+        counts[u.role] = (counts[u.role] || 0) + 1;
+      }
+    }
+    return counts;
+  }, [users, roles]);
+
+  const activeCount = useMemo(() => users.filter((u) => u.status === 'active').length, [users]);
+
+  const sortedRoles = useMemo(() => {
+    return [...roles].sort((a, b) => (roleCounts[b.slug] || 0) - (roleCounts[a.slug] || 0));
+  }, [roles, roleCounts]);
+
+  const filteredUsers = useMemo(() => {
+    let result = users.filter((user) => {
+      const text = `${user.email} ${user.fullName || ''} ${user.department || ''} ${user.site || ''} ${user.role} ${user.status}`.toLowerCase();
+      const matchesSearch = text.includes(search.toLowerCase());
+      const matchesRole = roleFilter ? user.role === roleFilter : true;
+      const matchesStatus = statusFilter ? user.status === statusFilter : true;
+      return matchesSearch && matchesRole && matchesStatus;
+    });
+
+    if (sortConfig?.key) {
+      result.sort((a, b) => {
+        const aVal = String((a as any)[sortConfig.key] || '').toLowerCase();
+        const bVal = String((b as any)[sortConfig.key] || '').toLowerCase();
+        if (aVal < bVal) return sortConfig.direction === 'asc' ? -1 : 1;
+        if (aVal > bVal) return sortConfig.direction === 'asc' ? 1 : -1;
+        return 0;
+      });
+    } else {
+      result.sort((a, b) => {
+        const aVal = String(a.fullName || '').toLowerCase();
+        const bVal = String(b.fullName || '').toLowerCase();
+        if (aVal < bVal) return -1;
+        if (aVal > bVal) return 1;
+        return 0;
+      });
+    }
+
+    return result;
+  }, [users, search, roleFilter, statusFilter, sortConfig]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredUsers.length / itemsPerPage));
+  const paginatedUsers = useMemo(() => {
+    const startIndex = (currentPage - 1) * itemsPerPage;
+    return filteredUsers.slice(startIndex, startIndex + itemsPerPage);
+  }, [filteredUsers, currentPage, itemsPerPage]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [search, roleFilter, statusFilter]);
+
+  const handleSort = (key: string) => {
+    setSortConfig((current) => {
+      if (current?.key === key) {
+        if (current.direction === 'asc') return { key, direction: 'desc' };
+        if (current.direction === 'desc') return null;
+      }
+      return { key, direction: 'asc' };
+    });
+  };
+
+  const confirmDisableUser = async (id: string) => {
+    setBusyId(id);
+    const prevUsers = [...users];
+    
+    // Optimistic update
+    setUsers(users.map(u => u.uid === id ? { ...u, status: 'disabled' } : u));
+    setDisableUser(null);
+
+    try {
+      await userService.disable(id);
+      toast.success('User disabled');
+      // No need to loadUsers() here as we have realtime subscriptions catching updates
+    } catch (error: any) {
+      setUsers(prevUsers); // Rollback
+      toast.error(error.message || 'Unable to disable user');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const enableUserAccount = async (id: string) => {
+    setBusyId(id);
+    const prevUsers = [...users];
+    
+    // Optimistic update
+    setUsers(users.map(u => u.uid === id ? { ...u, status: 'active' } : u));
+    setEnableUser(null);
+
+    try {
+      await userService.update(id, { status: 'active' });
+      toast.success('User enabled');
+    } catch (error: any) {
+      setUsers(prevUsers); // Rollback
+      toast.error(error.message || 'Unable to enable user');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const deleteUserAccount = async () => {
+    if (!deleteUser) return;
+
+    setBusyId(deleteUser.uid);
+    const prevUsers = [...users];
+    
+    // Optimistic update
+    setUsers(users.filter(u => u.uid !== deleteUser.uid));
+    const targetId = deleteUser.uid;
+    
+    if (editingId === targetId) cancelEditing();
+    if (disableUser?.uid === targetId) setDisableUser(null);
+    setDeleteUser(null);
+
+    try {
+      await userService.remove(targetId);
+      toast.success('User deleted');
+    } catch (error: any) {
+      setUsers(prevUsers); // Rollback
+      toast.error(error.message || 'Unable to delete user');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const startEditing = (user: AppUser) => {
+    setDisableUser(null);
+    setEditingId(user.uid);
+    setEditDraft(toEditDraft(user));
+  };
+
+  const cancelEditing = () => {
+    setEditingId(null);
+    setEditDraft(null);
+  };
+
+  const saveUser = async (id: string) => {
+    if (!editDraft) return;
+
+    if (!editDraft.department.trim()) {
+      toast.error('Select a department');
+      return;
+    }
+
+    if (!editDraft.site.trim()) {
+      toast.error('Select a site');
+      return;
+    }
+
+    setBusyId(id);
+    const prevUsers = [...users];
+    
+    // Optimistic update
+    setUsers(users.map(u => u.uid === id ? { 
+      ...u, 
+      department: editDraft.department.trim(),
+      site: editDraft.site.trim(),
+      role: editDraft.role,
+      status: editDraft.status
+    } : u));
+    cancelEditing();
+
+    try {
+      await userService.update(id, {
+        department: editDraft.department.trim(),
+        site: editDraft.site.trim(),
+        role: editDraft.role,
+        status: editDraft.status,
+      });
+      toast.success('User updated');
+    } catch (error: any) {
+      setUsers(prevUsers); // Rollback
+      toast.error(error.message || 'Unable to update user');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const departmentSelectOptions = useMemo(() => {
+    const options = [...departmentOptions];
+    if (editDraft?.department && !options.includes(editDraft.department)) {
+      options.unshift(editDraft.department);
+    }
+    return options;
+  }, [departmentOptions, editDraft?.department]);
+
+  const siteSelectOptions = useMemo(() => {
+    const options = [...siteOptions];
+    if (editDraft?.site && !options.includes(editDraft.site)) {
+      options.unshift(editDraft.site);
+    }
+    return options;
+  }, [siteOptions, editDraft?.site]);
+
+  const rolesBySlug = useMemo(() => {
+    const map = new Map<string, Role>();
+    roles.forEach((role) => map.set(role.slug, role));
+    return map;
+  }, [roles]);
+
+  const openPermissions = (account: AppUser) => {
+    const roleCaps = rolesBySlug.get(account.role)?.capabilities || [];
+    setPermsTarget(account);
+    setPermsDraft([...roleCaps]);
+  };
+
+  const togglePerm = (key: string) => {
+    setPermsDraft((current) => (current.includes(key) ? current.filter((cap) => cap !== key) : [...current, key]));
+  };
+
+  const savePermissions = async () => {
+    if (!permsTarget) return;
+    setPermsSaving(true);
+    try {
+      const roleObj = rolesBySlug.get(permsTarget.role);
+      if (!roleObj) throw new Error('Role not found');
+      
+      await roleService.update(permsTarget.role, { 
+        name: roleObj.name, 
+        capabilities: permsDraft 
+      });
+      
+      toast.success(`${roleLabel(permsTarget.role, rolesBySlug)} role updated`);
+      
+      setRoles(current => current.map(r => 
+        r.slug === permsTarget.role ? { ...r, capabilities: permsDraft } : r
+      ));
+      
+      setPermsTarget(null);
+      setRefreshTrigger(prev => prev + 1);
+    } catch (error: any) {
+      toast.error(error.message || 'Unable to update permissions');
+    } finally {
+      setPermsSaving(false);
+    }
+  };
+
+  return (
+    <PageLayout title="System Permissions & Users" contentClassName="w-full max-w-[1600px] mx-auto">
+      <div className="flex flex-col gap-6 w-full">
+        <div className="inline-flex w-fit items-center gap-1 rounded-xl border p-1" style={{ borderColor: 'var(--color-border)', backgroundColor: 'var(--color-surface)' }}>
+          {(['users', 'roles'] as const).map((tab) => {
+            const isActive = view === tab;
+            return (
+              <button
+                key={tab}
+                type="button"
+                onClick={() => setView(tab)}
+                className="relative min-h-10 rounded-lg px-4 py-2 text-sm font-bold transition-colors"
+                style={{ color: isActive ? 'var(--color-surface)' : 'var(--color-text-muted)' }}
+              >
+                {isActive && (
+                  <motion.div
+                    layoutId="userManagementTabPill"
+                    className="absolute inset-0 rounded-lg"
+                    style={{ backgroundColor: 'var(--color-accent)' }}
+                    transition={{ type: "spring", bounce: 0.2, duration: 0.6 }}
+                  />
+                )}
+                <span className="relative z-10">{tab === 'users' ? 'Users' : 'Roles & Permissions'}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        {view === 'roles' ? (
+          <RolesPanel />
+        ) : (
+        <>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 flex-1 min-w-[300px]">
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 text-[#9CA3AF] absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                placeholder="Search accounts..."
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                className="w-full pl-10 pr-4 py-2.5 bg-white border border-[#E5E7EB] rounded-xl text-sm focus:ring-2 focus:ring-[#111827] transition-all outline-none"
+              />
+            </div>
+            <div className="flex items-center gap-1.5 z-10 relative">
+              <AnimatedSelect
+                value={roleFilter}
+                onChange={setRoleFilter}
+                options={[
+                  { value: '', label: 'All Roles' },
+                  ...roles.map((r) => ({ value: r.slug, label: r.name })),
+                ]}
+                className="min-w-[160px]"
+              />
+              <AnimatedSelect
+                value={statusFilter}
+                onChange={setStatusFilter}
+                options={[
+                  { value: '', label: 'All Statuses' },
+                  { value: 'active', label: 'Active' },
+                  { value: 'disabled', label: 'Inactive' },
+                ]}
+                className="min-w-[140px]"
+              />
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              const validDepartments = departmentOptions.filter(d => Boolean(d && String(d).trim()));
+              if (validDepartments.length === 0) {
+                setShowMissingDepartmentModal(true);
+                setShowRegister(false);
+              } else {
+                setShowRegister(true);
+                setShowMissingDepartmentModal(false);
+              }
+            }}
+            className="inline-flex min-h-11 shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-xl bg-[#111827] px-5 py-2.5 text-sm font-bold text-white shadow-sm transition-all hover:bg-[#374151] active:scale-[0.98]"
+          >
+            <UserPlus className="h-4 w-4" />
+            Register Account
+          </button>
+        </div>
+
+        <AnimatePresence mode="wait" initial={false}>
+          {isLoading ? (
+            <motion.div key="skeleton-summary" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2, ease: 'easeOut' }} className="flex flex-col lg:flex-row gap-6">
+              <div className="grid w-full grid-cols-1 gap-6 sm:grid-cols-2 xl:grid-cols-4">
+                {[...Array(4)].map((_, i) => (
+                  <div key={`sk-summary-${i}`} className="p-6 rounded-2xl border border-[#E5E7EB] bg-white shadow-sm flex items-center gap-4 animate-pulse">
+                    <div className="w-11 h-11 rounded-xl bg-gray-200" />
+                    <div className="flex-1 space-y-2">
+                      <div className="h-4 w-24 bg-gray-200 rounded" />
+                      <div className="h-3 w-16 bg-gray-200 rounded" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </motion.div>
+          ) : (
+            <motion.div key="content-summary" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.3, ease: 'easeOut' }} className="flex flex-col gap-6">
+                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-6">
+                  <SummaryCard label="Active Accounts" count={activeCount} icon={UsersRound} color="text-green-700" bg="bg-green-50" />
+                  
+                  {sortedRoles.slice(0, showAllRoles ? undefined : 2).map((r, i) => {
+                    const colors = [
+                      { color: "text-[#111827]", bg: "bg-[#F3F4F6]" },
+                      { color: "text-blue-700", bg: "bg-blue-50" },
+                      { color: "text-purple-700", bg: "bg-purple-50" },
+                      { color: "text-orange-700", bg: "bg-orange-50" },
+                      { color: "text-teal-700", bg: "bg-teal-50" },
+                      { color: "text-rose-700", bg: "bg-rose-50" },
+                    ];
+                    const scheme = colors[i % colors.length];
+                    return (
+                      <SummaryCard key={r.slug} label={r.name} count={roleCounts[r.slug] || 0} icon={ShieldCheck} color={scheme.color} bg={scheme.bg} />
+                    );
+                  })}
+
+                  {!showAllRoles && sortedRoles.length > 2 && (
+                    <button 
+                      onClick={() => setShowAllRoles(true)}
+                      className="p-6 rounded-2xl border border-dashed border-[#CBD5E1] hover:border-blue-500 hover:bg-blue-50/50 bg-gray-50 flex flex-col items-center justify-center gap-2 transition-all cursor-pointer group outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      <div className="p-2 rounded-full bg-white shadow-sm text-gray-400 group-hover:text-blue-600 transition-colors">
+                        <ChevronDown className="w-5 h-5" />
+                      </div>
+                      <span className="text-sm font-bold text-gray-500 group-hover:text-blue-700">View {sortedRoles.length - 2} More Roles</span>
+                    </button>
+                  )}
+                </div>
+
+                {showAllRoles && sortedRoles.length > 2 && (
+                  <div className="flex justify-center -mt-2">
+                    <button 
+                      onClick={() => setShowAllRoles(false)}
+                      className="text-[11px] font-black text-gray-400 hover:text-gray-700 flex items-center gap-1 transition-colors uppercase tracking-widest px-4 py-2 hover:bg-gray-100 rounded-lg outline-none focus:ring-2 focus:ring-gray-300"
+                    >
+                      <ChevronUp className="w-3.5 h-3.5" />
+                      Show Less
+                    </button>
+                  </div>
+                )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence mode="wait" initial={false}>
+          {isLoading ? (
+            <motion.div key="skeleton-table" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2, ease: 'easeOut' }} className="bg-white border border-[#E5E7EB] rounded-2xl shadow-sm relative">
+              <table className="w-full text-left border-collapse table-fixed">
+                <thead>
+                  <tr className="bg-[#F9FAFB] border-b border-[#E5E7EB] [&>th:first-child]:rounded-tl-2xl [&>th:last-child]:rounded-tr-2xl">
+                    <SortableHeader label="User" sortKey="fullName" currentSort={sortConfig} onSort={handleSort} className="w-[22%]" />
+                    <SortableHeader label="Role" sortKey="role" currentSort={sortConfig} onSort={handleSort} className="w-[16%]" />
+                    <SortableHeader label="Department" sortKey="department" currentSort={sortConfig} onSort={handleSort} className="w-[18%]" />
+                    <SortableHeader label="Site" sortKey="site" currentSort={sortConfig} onSort={handleSort} className="w-[15%]" />
+                    <SortableHeader label="Status" sortKey="status" currentSort={sortConfig} onSort={handleSort} className="w-[12%]" />
+                    <th className="px-4 py-4 w-[17%] text-[0.625rem] font-black text-[#9CA3AF] uppercase tracking-widest text-right"></th>
+                  </tr>
+                </thead>
+                <tbody className="">
+                  {[...Array(5)].map((_, i) => (
+                    <tr key={i} className="animate-pulse border-b border-[#F3F4F6] last:border-0">
+                      <td className="px-6 py-4">
+                        <div className="flex items-center gap-3">
+                          <div className="w-9 h-9 rounded-full bg-gray-200 shrink-0"></div>
+                          <div className="flex-1 space-y-2"><div className="h-4 w-32 bg-gray-200 rounded"></div><div className="h-3 w-40 bg-gray-200 rounded"></div></div>
+                        </div>
+                      </td>
+                      <td className="px-6 py-4"><div className="h-4 w-20 bg-gray-200 rounded"></div></td>
+                      <td className="px-6 py-4"><div className="h-4 w-28 bg-gray-200 rounded"></div></td>
+                      <td className="px-6 py-4"><div className="h-4 w-32 bg-gray-200 rounded"></div></td>
+                      <td className="px-6 py-4"><div className="h-6 w-16 bg-gray-200 rounded-lg"></div></td>
+                      <td className="px-6 py-4"><div className="h-9 w-24 bg-gray-200 rounded-lg ml-auto"></div></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <SkeletonLoadingMessage message="Loading account information..." />
+            </motion.div>
+          ) : (
+            <motion.div key="content-table" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.3, ease: 'easeOut' }} className="bg-white border border-[#E5E7EB] rounded-2xl shadow-sm">
+              <table className="w-full text-left border-collapse table-fixed">
+                <thead>
+                  <tr className="bg-[#F9FAFB] border-b border-[#E5E7EB] [&>th:first-child]:rounded-tl-2xl [&>th:last-child]:rounded-tr-2xl">
+                    <SortableHeader label="User" sortKey="fullName" currentSort={sortConfig} onSort={handleSort} className="w-[22%]" />
+                    <SortableHeader label="Role" sortKey="role" currentSort={sortConfig} onSort={handleSort} className="w-[16%]" />
+                    <SortableHeader label="Department" sortKey="department" currentSort={sortConfig} onSort={handleSort} className="w-[18%]" />
+                    <SortableHeader label="Site" sortKey="site" currentSort={sortConfig} onSort={handleSort} className="w-[15%]" />
+                    <SortableHeader label="Status" sortKey="status" currentSort={sortConfig} onSort={handleSort} className="w-[12%]" />
+                    <th className="px-4 py-4 w-[17%] text-[0.625rem] font-black text-[#9CA3AF] uppercase tracking-widest text-right"></th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#F3F4F6]">
+                  {paginatedUsers.map((user, index) => {
+                    const isEditing = editingId === user.uid;
+                    const canEdit = user.role !== 'super_admin';
+
+                    return (
+                      <motion.tr
+                        key={user.uid}
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: index * 0.05, type: 'spring', stiffness: 380, damping: 30 }}
+                        className="hover:bg-[#F9FAFB] transition-colors border-b border-[#F3F4F6] last:border-0"
+                      >
+                        <td className="px-4 py-4">
+                          <div className="flex items-center gap-3">
+                            <div className="w-9 h-9 rounded-full bg-[#F3F4F6] flex items-center justify-center text-[0.625rem] font-black text-[#111827] border border-[#E5E7EB]">
+                              {getInitials(user.fullName || '', user.email)}
+                            </div>
+                            <div className="min-w-0">
+                              <p className="text-sm font-bold text-[#111827] truncate">{user.fullName || user.email}</p>
+                              <p className="text-[0.625rem] text-[#9CA3AF] font-bold tracking-tighter uppercase">{user.email}</p>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-6 py-4">
+                          <AnimatePresence mode="wait">
+                            {isEditing && editDraft ? (
+                              <motion.div key="edit-role" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 5 }} transition={{ duration: 0.15 }}>
+                                <AnimatedSelect
+                                  value={editDraft.role}
+                                  onChange={(val) =>
+                                    setEditDraft((current) =>
+                                      current ? { ...current, role: val as UserRole } : current
+                                    )
+                                  }
+                                  options={roles.filter((role) => role.slug !== 'super_admin').map((role) => ({ value: role.slug, label: role.name }))}
+                                  disabled={busyId === user.uid}
+                                  className="w-full"
+                                />
+                              </motion.div>
+                            ) : (
+                              <motion.div key="view-role" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 5 }} transition={{ duration: 0.15 }} className="flex items-center gap-2">
+                                <ShieldCheck className="w-4 h-4 text-[#D1D5DB]" />
+                                <span className="text-xs font-black text-[#4B5563] uppercase tracking-tight">{roleLabel(user.role, rolesBySlug)}</span>
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
+                        </td>
+                        <td className="px-6 py-4">
+                          <AnimatePresence mode="wait">
+                            {isEditing && editDraft ? (
+                              <motion.div key="edit-dept" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 5 }} transition={{ duration: 0.15 }}>
+                                <AnimatedSelect
+                                  value={editDraft.department}
+                                  onChange={(val) =>
+                                    setEditDraft((current) => (current ? { ...current, department: val } : current))
+                                  }
+                                  options={[
+                                    { value: '', label: 'Select department' },
+                                    ...departmentSelectOptions.map((dept) => ({ value: dept, label: dept }))
+                                  ]}
+                                  disabled={busyId === user.uid || !departmentSelectOptions.length}
+                                  className="w-full"
+                                />
+                              </motion.div>
+                            ) : (
+                              <motion.div key="view-dept" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 5 }} transition={{ duration: 0.15 }}>
+                                <span className="text-xs font-bold text-[#4B5563]">{user.department || 'Unassigned'}</span>
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
+                        </td>
+                        <td className="px-6 py-4">
+                          <AnimatePresence mode="wait">
+                            {isEditing && editDraft ? (
+                              <motion.div key="edit-site" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 5 }} transition={{ duration: 0.15 }}>
+                                <AnimatedSelect
+                                  value={editDraft.site}
+                                  onChange={(val) =>
+                                    setEditDraft((current) => (current ? { ...current, site: val } : current))
+                                  }
+                                  options={[
+                                    { value: '', label: 'Select site' },
+                                    ...siteSelectOptions.map((site) => ({ value: site, label: site }))
+                                  ]}
+                                  disabled={busyId === user.uid || !siteSelectOptions.length}
+                                  className="w-full"
+                                />
+                              </motion.div>
+                            ) : (
+                              <motion.div key="view-site" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 5 }} transition={{ duration: 0.15 }}>
+                                <span className="text-xs font-bold text-[#4B5563]">{user.site || 'HQ'}</span>
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
+                        </td>
+                        <td className="px-6 py-4">
+                          <AnimatePresence mode="wait">
+                            {isEditing && editDraft ? (
+                              <motion.div key="edit-status" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 5 }} transition={{ duration: 0.15 }} className="flex items-center gap-2">
+                                <AnimatedSelect
+                                  value={editDraft.status}
+                                  onChange={(val) =>
+                                    setEditDraft((current) =>
+                                      current ? { ...current, status: val as EditableAccountStatus } : current
+                                    )
+                                  }
+                                  options={EDITABLE_ACCOUNT_STATUSES}
+                                  disabled={busyId === user.uid}
+                                  className="flex-1"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setPasswordEditUser(user);
+                                    setNewPassword('');
+                                    setShowPassword(false);
+                                  }}
+                                  disabled={busyId === user.uid}
+                                  className="group relative inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-[#E5E7EB] bg-white text-[#4B5563] transition-all hover:bg-[#F9FAFB] hover:text-[#111827] disabled:opacity-50"
+                                >
+                                  <Key className="h-4 w-4" />
+                                  <ActionTooltip label="Edit Password" />
+                                </button>
+                              </motion.div>
+                            ) : (
+                              <motion.div key="view-status" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 5 }} transition={{ duration: 0.15 }}>
+                                <span className={`px-2 py-0.5 rounded-lg text-[0.625rem] font-black uppercase tracking-tighter ${statusClass(user.status)}`}>
+                                  {statusLabel(user.status)}
+                                </span>
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
+                        </td>
+                        <td className="px-6 py-4">
+                          <div className="flex items-center justify-end gap-2">
+                            {isEditing ? (
+                              <>
+                                <button
+                                  onClick={() => saveUser(user.uid)}
+                                  disabled={busyId === user.uid}
+                                  aria-label="Save changes"
+                                  className="group relative inline-flex h-10 w-10 min-w-10 shrink-0 items-center justify-center bg-[#111827] text-white rounded-lg hover:bg-[#374151] disabled:opacity-50"
+                                >
+                                  {busyId === user.uid ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                                  <ActionTooltip label="Save Changes" />
+                                </button>
+                                <button
+                                  onClick={cancelEditing}
+                                  disabled={busyId === user.uid}
+                                  aria-label="Cancel editing"
+                                  className="group relative inline-flex h-10 w-10 min-w-10 shrink-0 items-center justify-center bg-white border border-[#E5E7EB] text-[#4B5563] rounded-lg hover:bg-[#F9FAFB] disabled:opacity-50"
+                                >
+                                  <X className="w-4 h-4" />
+                                  <ActionTooltip label="Cancel" />
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                {canEdit && (
+                                  <button
+                                    onClick={() => startEditing(user)}
+                                    disabled={busyId === user.uid || editingId !== null || disableUser !== null || enableUser !== null}
+                                    aria-label="Edit user"
+                                    className="group relative inline-flex h-10 w-10 min-w-10 shrink-0 items-center justify-center bg-white border border-[#E5E7EB] text-[#4B5563] rounded-lg hover:bg-[#F9FAFB] disabled:opacity-50"
+                                  >
+                                    <Pencil className="w-4 h-4" />
+                                    <ActionTooltip label="Edit User" />
+                                  </button>
+                                )}
+                                {canEdit && (
+                                  <button
+                                    onClick={() => openPermissions(user)}
+                                    disabled={busyId === user.uid || editingId !== null || disableUser !== null || enableUser !== null}
+                                    aria-label="Edit permissions"
+                                    className="group relative inline-flex h-10 w-10 min-w-10 shrink-0 items-center justify-center bg-white border border-[#E5E7EB] text-[#4B5563] rounded-lg hover:bg-[#F9FAFB] disabled:opacity-50"
+                                  >
+                                    <SlidersHorizontal className="w-4 h-4" />
+                                    <ActionTooltip label="Permissions" />
+                                  </button>
+                                )}
+                                {user.status === 'active' && canEdit && (
+                                  <button
+                                    onClick={() => {
+                                      cancelEditing();
+                                      setDisableUser(user);
+                                    }}
+                                    disabled={busyId === user.uid || editingId !== null || disableUser !== null}
+                                    className="group relative inline-flex h-10 w-10 min-w-10 shrink-0 items-center justify-center bg-white border border-[#E5E7EB] text-[#B91C1C] rounded-lg hover:bg-[#F9FAFB] disabled:opacity-50"
+                                  >
+                                    <UserX className="w-4 h-4" />
+                                    <ActionTooltip label="Disable User" />
+                                  </button>
+                                )}
+                                {user.status === 'disabled' && canEdit && (
+                                  <button
+                                    onClick={() => setEnableUser(user)}
+                                    disabled={busyId === user.uid || editingId !== null || disableUser !== null || enableUser !== null}
+                                    className="group relative inline-flex h-10 w-10 min-w-10 shrink-0 items-center justify-center bg-white border border-[#E5E7EB] text-[#059669] rounded-lg hover:bg-[#F9FAFB] disabled:opacity-50"
+                                  >
+                                    <ShieldCheck className="w-4 h-4" />
+                                    <ActionTooltip label="Enable User" />
+                                  </button>
+                                )}
+                                {canEdit && (
+                                  <button
+                                    onClick={() => {
+                                      setDisableUser(null);
+                                      setDeleteUser(user);
+                                      setDeleteInput('');
+                                    }}
+                                    disabled={busyId === user.uid || editingId !== null || disableUser !== null || enableUser !== null}
+                                    aria-label="Delete user"
+                                    className="group relative inline-flex h-10 w-10 min-w-10 shrink-0 items-center justify-center bg-white border border-[#E5E7EB] text-[#B91C1C] rounded-lg hover:bg-[#F9FAFB] disabled:opacity-50"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
+                                    <ActionTooltip label="Delete User" />
+                                  </button>
+                                )}
+                              </>
+                            )}
+                          </div>
+                        </td>
+                      </motion.tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+
+              {(!isLoading && filteredUsers.length === 0) && (
+                <div className="p-12 text-center rounded-b-2xl">
+                  <div className="w-16 h-16 bg-[#F3F4F6] rounded-2xl flex items-center justify-center mx-auto mb-4">
+                    <UsersRound className="w-8 h-8 text-[#D1D5DB]" />
+                  </div>
+                  <h3 className="text-lg font-bold text-[#111827]">No users found</h3>
+                </div>
+              )}
+
+              {(!isLoading && filteredUsers.length > 0) && (
+                <div className="px-6 py-4 border-t border-[#E5E7EB] bg-[#F9FAFB] rounded-b-2xl flex flex-col sm:flex-row items-center justify-between gap-4">
+                  <span className="text-xs font-bold text-[#6B7280]">
+                    Showing {((currentPage - 1) * itemsPerPage) + 1} to {Math.min(currentPage * itemsPerPage, filteredUsers.length)} of {filteredUsers.length} entries
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                      disabled={currentPage === 1}
+                      className="px-3 py-1.5 border border-[#E5E7EB] bg-white text-xs font-bold text-[#4B5563] rounded-lg hover:bg-[#F3F4F6] disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Previous
+                    </button>
+                    <div className="flex items-center gap-1 hidden sm:flex">
+                      {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+                        let pageNum = currentPage;
+                        if (totalPages <= 5) pageNum = i + 1;
+                        else if (currentPage <= 3) pageNum = i + 1;
+                        else if (currentPage >= totalPages - 2) pageNum = totalPages - 4 + i;
+                        else pageNum = currentPage - 2 + i;
+
+                        if (pageNum < 1 || pageNum > totalPages) return null;
+
+                        return (
+                          <button
+                            key={pageNum}
+                            onClick={() => setCurrentPage(pageNum)}
+                            className={`w-8 h-8 flex items-center justify-center rounded-lg text-xs font-bold transition-colors ${currentPage === pageNum
+                              ? 'bg-[#111827] text-white shadow-sm'
+                              : 'text-[#4B5563] hover:bg-[#E5E7EB]'
+                              }`}
+                          >
+                            {pageNum}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <button
+                      onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                      disabled={currentPage === totalPages}
+                      className="px-3 py-1.5 border border-[#E5E7EB] bg-white text-xs font-bold text-[#4B5563] rounded-lg hover:bg-[#F3F4F6] disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Next
+                    </button>
+                  </div>
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+        </>
+        )}
+      </div>
+
+      <AnimatePresence>
+        {deleteUser && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/45 px-4 py-6 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={{ opacity: 0, y: 30, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 30, scale: 0.95 }}
+              transition={{ type: 'spring', stiffness: 380, damping: 30 }}
+              className="w-full max-w-md rounded-2xl border border-[#E5E7EB] bg-white shadow-2xl"
+            >
+              <div className="flex items-start gap-4 border-b border-[#E5E7EB] px-6 py-5">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-red-100">
+                  <Trash2 className="h-5 w-5 text-red-600" />
+                </div>
+                <div className="flex-1">
+                  <h2 className="text-lg font-black text-[#111827]">Delete User</h2>
+                  <p className="mt-1 text-xs font-bold text-[#6B7280]">This action is permanent and cannot be undone.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeleteUser(null);
+                    setDeleteInput('');
+                  }}
+                  className="rounded-lg p-2 text-[#9CA3AF] transition-colors hover:bg-[#F3F4F6] hover:text-[#4B5563]"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <div className="space-y-5 p-6">
+                <div className="rounded-xl border border-red-200 bg-red-50 p-4">
+                  <div className="flex items-center gap-2 text-red-700">
+                    <AlertTriangle className="h-4 w-4 shrink-0" />
+                    <span className="text-xs font-black uppercase tracking-wide">Permanent Deletion Warning</span>
+                  </div>
+                  <ul className="mt-2 space-y-1 pl-6 text-[0.6875rem] font-medium leading-relaxed text-red-600 list-disc">
+                    <li>All user data and access will be permanently removed.</li>
+                    <li>The user will be immediately logged out of all sessions.</li>
+                    <li>Historical audit logs will retain the user's ID.</li>
+                  </ul>
+                </div>
+
+                <div className="rounded-xl border border-[#F3F4F6] bg-[#F9FAFB] p-4">
+                  <p className="text-sm font-bold text-[#111827] mb-0.5">{deleteUser.fullName || 'No Name'}</p>
+                  <p className="text-[0.625rem] font-bold text-[#6B7280] uppercase tracking-wider mb-3">{deleteUser.email}</p>
+                  <div className="grid grid-cols-2 gap-y-2 text-xs">
+                    <div>
+                      <span className="text-[#9CA3AF] font-bold block mb-0.5 uppercase tracking-wider text-[0.625rem]">Role</span>
+                      <span className="font-bold text-[#4B5563]">{roleLabel(deleteUser.role, rolesBySlug)}</span>
+                    </div>
+                    <div>
+                      <span className="text-[#9CA3AF] font-bold block mb-0.5 uppercase tracking-wider text-[0.625rem]">Department</span>
+                      <span className="font-bold text-[#4B5563]">{deleteUser.department || 'Unassigned'}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <p className="text-sm text-[#4B5563]">
+                  You are about to permanently delete <span className="font-black text-[#111827]">&ldquo;{deleteUser.fullName || deleteUser.email}&rdquo;</span>.
+                </p>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="block text-xs font-black text-[#111827]">Confirm Deletion</label>
+                  </div>
+                  <input
+                    type="text"
+                    value={deleteInput}
+                    onChange={(e) => setDeleteInput(e.target.value)}
+                    placeholder="CONFIRM"
+                    className={`w-full rounded-xl border px-4 py-2.5 text-sm font-bold outline-none transition-all ${deleteInput === 'CONFIRM'
+                        ? 'border-green-400 focus:ring-2 focus:ring-[#111827]'
+                        : deleteInput.length > 0
+                          ? 'border-red-300 focus:ring-2 focus:ring-red-500'
+                          : 'border-[#E5E7EB] focus:ring-2 focus:ring-[#111827]'
+                      }`}
+                  />
+                  <p className="text-[0.6875rem] font-bold text-[#6B7280] mt-2">Type "CONFIRM" to enable the Delete button.</p>
+                </div>
+
+                <div className="flex items-center justify-end gap-3 border-t border-[#F3F4F6] pt-5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDeleteUser(null);
+                      setDeleteInput('');
+                    }}
+                    disabled={busyId === deleteUser.uid}
+                    className="min-h-11 whitespace-nowrap rounded-xl border border-[#E5E7EB] bg-white px-5 py-2.5 text-sm font-bold text-[#4B5563] transition-all hover:text-[#111827] hover:bg-[#F9FAFB] disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={deleteUserAccount}
+                    disabled={busyId === deleteUser.uid || deleteInput !== 'CONFIRM'}
+                    className="inline-flex min-h-11 items-center justify-center gap-2 whitespace-nowrap rounded-xl bg-red-600 px-6 py-2.5 text-sm font-black text-white shadow-lg shadow-red-600/20 transition-all hover:bg-red-700 disabled:opacity-60"
+                  >
+                    {busyId === deleteUser.uid && <Loader2 className="h-4 w-4 animate-spin" />}
+                    Delete Permanently
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {disableUser && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/45 px-4 py-6 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={{ opacity: 0, y: 30, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 30, scale: 0.95 }}
+              transition={{ type: 'spring', stiffness: 380, damping: 30 }}
+              className="w-full max-w-md rounded-2xl border border-[#E5E7EB] bg-white shadow-2xl"
+            >
+              <div className="flex items-start gap-4 border-b border-[#E5E7EB] px-6 py-5">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-orange-100">
+                  <UserX className="h-5 w-5 text-orange-600" />
+                </div>
+                <div className="flex-1">
+                  <h2 className="text-lg font-black text-[#111827]">Disable User</h2>
+                  <p className="mt-1 text-xs font-bold text-[#6B7280]">This will prevent the user from accessing the system.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDisableUser(null)}
+                  className="rounded-lg p-2 text-[#9CA3AF] transition-colors hover:bg-[#F3F4F6] hover:text-[#4B5563]"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <div className="space-y-5 p-6">
+                <div className="rounded-xl border border-orange-200 bg-orange-50 p-4">
+                  <div className="flex items-center gap-2 text-orange-700">
+                    <AlertTriangle className="h-4 w-4 shrink-0" />
+                    <span className="text-xs font-black uppercase tracking-wide">Account Suspension Warning</span>
+                  </div>
+                  <ul className="mt-2 space-y-1 pl-6 text-[0.6875rem] font-medium leading-relaxed text-orange-700 list-disc">
+                    <li>User will immediately lose all access to the system.</li>
+                    <li>Active sessions will be terminated.</li>
+                    <li>You can re-enable this account at any time.</li>
+                  </ul>
+                </div>
+
+                <div className="rounded-xl border border-[#F3F4F6] bg-[#F9FAFB] p-4">
+                  <p className="text-sm font-bold text-[#111827] mb-0.5">{disableUser.fullName || 'No Name'}</p>
+                  <p className="text-[0.625rem] font-bold text-[#6B7280] uppercase tracking-wider mb-3">{disableUser.email}</p>
+                  <div className="grid grid-cols-2 gap-y-2 text-xs">
+                    <div>
+                      <span className="text-[#9CA3AF] font-bold block mb-0.5 uppercase tracking-wider text-[0.625rem]">Role</span>
+                      <span className="font-bold text-[#4B5563]">{roleLabel(disableUser.role, rolesBySlug)}</span>
+                    </div>
+                    <div>
+                      <span className="text-[#9CA3AF] font-bold block mb-0.5 uppercase tracking-wider text-[0.625rem]">Department</span>
+                      <span className="font-bold text-[#4B5563]">{disableUser.department || 'Unassigned'}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <p className="text-sm text-[#4B5563]">
+                  You are about to suspend access for <span className="font-black text-[#111827]">&ldquo;{disableUser.fullName || disableUser.email}&rdquo;</span>.
+                </p>
+
+                <div className="flex items-center justify-end gap-3 border-t border-[#F3F4F6] pt-5">
+                  <button
+                    type="button"
+                    onClick={() => setDisableUser(null)}
+                    disabled={busyId === disableUser.uid}
+                    className="min-h-11 whitespace-nowrap rounded-xl border border-[#E5E7EB] bg-white px-5 py-2.5 text-sm font-bold text-[#4B5563] transition-all hover:text-[#111827] hover:bg-[#F9FAFB] disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => confirmDisableUser(disableUser.uid)}
+                    disabled={busyId === disableUser.uid}
+                    className="inline-flex min-h-11 items-center justify-center gap-2 whitespace-nowrap rounded-xl bg-orange-600 px-6 py-2.5 text-sm font-black text-white shadow-lg shadow-orange-600/20 transition-all hover:bg-orange-700 disabled:opacity-60"
+                  >
+                    {busyId === disableUser.uid ? <Loader2 className="h-4 w-4 animate-spin" /> : <UserX className="w-4 h-4" />}
+                    Suspend Account
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {enableUser && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/45 px-4 py-6 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={{ opacity: 0, y: 30, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 30, scale: 0.95 }}
+              transition={{ type: 'spring', stiffness: 380, damping: 30 }}
+              className="w-full max-w-md rounded-2xl border border-[#E5E7EB] bg-white shadow-2xl"
+            >
+              <div className="flex items-start gap-4 border-b border-[#E5E7EB] px-6 py-5">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-emerald-100">
+                  <ShieldCheck className="h-5 w-5 text-emerald-600" />
+                </div>
+                <div className="flex-1">
+                  <h2 className="text-lg font-black text-[#111827]">Enable User</h2>
+                  <p className="mt-1 text-xs font-bold text-[#6B7280]">Restore the user's access to the system.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setEnableUser(null)}
+                  className="rounded-lg p-2 text-[#9CA3AF] transition-colors hover:bg-[#F3F4F6] hover:text-[#4B5563]"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <div className="space-y-5 p-6">
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4">
+                  <div className="flex items-center gap-2 text-emerald-700">
+                    <ShieldCheck className="h-4 w-4 shrink-0" />
+                    <span className="text-xs font-black uppercase tracking-wide">Account Restoration</span>
+                  </div>
+                  <ul className="mt-2 space-y-1 pl-6 text-[0.6875rem] font-medium leading-relaxed text-emerald-700 list-disc">
+                    <li>User will regain their previous access permissions.</li>
+                    <li>They will be able to log in using their existing credentials.</li>
+                    <li>You can disable this account again if necessary.</li>
+                  </ul>
+                </div>
+
+                <div className="rounded-xl border border-[#F3F4F6] bg-[#F9FAFB] p-4">
+                  <p className="text-sm font-bold text-[#111827] mb-0.5">{enableUser.fullName || 'No Name'}</p>
+                  <p className="text-[0.625rem] font-bold text-[#6B7280] uppercase tracking-wider mb-3">{enableUser.email}</p>
+                  <div className="grid grid-cols-2 gap-y-2 text-xs">
+                    <div>
+                      <span className="text-[#9CA3AF] font-bold block mb-0.5 uppercase tracking-wider text-[0.625rem]">Role</span>
+                      <span className="font-bold text-[#4B5563]">{roleLabel(enableUser.role, rolesBySlug)}</span>
+                    </div>
+                    <div>
+                      <span className="text-[#9CA3AF] font-bold block mb-0.5 uppercase tracking-wider text-[0.625rem]">Department</span>
+                      <span className="font-bold text-[#4B5563]">{enableUser.department || 'Unassigned'}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <p className="text-sm text-[#4B5563]">
+                  You are about to restore access for <span className="font-black text-[#111827]">&ldquo;{enableUser.fullName || enableUser.email}&rdquo;</span>.
+                </p>
+
+                <div className="flex items-center justify-end gap-3 border-t border-[#F3F4F6] pt-5">
+                  <button
+                    type="button"
+                    onClick={() => setEnableUser(null)}
+                    disabled={busyId === enableUser.uid}
+                    className="min-h-11 whitespace-nowrap rounded-xl border border-[#E5E7EB] bg-white px-5 py-2.5 text-sm font-bold text-[#4B5563] transition-all hover:text-[#111827] hover:bg-[#F9FAFB] disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => enableUserAccount(enableUser.uid)}
+                    disabled={busyId === enableUser.uid}
+                    className="inline-flex min-h-11 items-center justify-center gap-2 whitespace-nowrap rounded-xl bg-[#059669] px-6 py-2.5 text-sm font-black text-white shadow-lg shadow-emerald-600/20 transition-all hover:bg-[#047857] disabled:opacity-60"
+                  >
+                    {busyId === enableUser.uid ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+                    Restore Account
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {showRegister && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/45 px-4 py-6 backdrop-blur-sm"
+            onClick={() => setShowRegister(false)}
+          >
+            <motion.div
+              initial={{ opacity: 0, y: 30, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 30, scale: 0.95 }}
+              transition={{ type: 'spring', stiffness: 380, damping: 30 }}
+              className="relative max-h-[90vh] w-full max-w-md overflow-y-auto rounded-[28px] border border-[#E5E7EB] bg-white p-8 shadow-2xl"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <button
+                type="button"
+                onClick={() => setShowRegister(false)}
+                className="absolute right-4 top-4 z-10 rounded-lg p-2 text-[#9CA3AF] transition-colors hover:bg-[#F3F4F6] hover:text-[#4B5563]"
+                aria-label="Close registration"
+              >
+                <X className="h-5 w-5" />
+              </button>
+              <RegisterForm
+                onSuccess={async (newUser) => {
+                  setShowRegister(false);
+                  try {
+                    // Accounts created by an admin are activated immediately with the
+                    // chosen role (update also records this admin as the approver).
+                    await userService.update(newUser.uid, { role: newUser.role, status: 'active' });
+                    toast.success(`Account created and activated as ${roleLabel(newUser.role, rolesBySlug)}`);
+                  } catch (error: any) {
+                    toast.error(error?.message || 'Account created, but activation failed — approve it manually.');
+                  }
+                  setRefreshTrigger(prev => prev + 1);
+                }}
+              />
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {permsTarget && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/45 px-4 py-6 backdrop-blur-sm"
+            onClick={() => setPermsTarget(null)}
+          >
+            <motion.div
+              initial={{ opacity: 0, y: 30, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 30, scale: 0.95 }}
+              transition={{ type: 'spring', stiffness: 380, damping: 30 }}
+              className="flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border bg-white shadow-2xl"
+              style={{ borderColor: 'var(--color-border)', backgroundColor: 'var(--color-surface)' }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start justify-between gap-4 border-b px-6 py-5" style={{ borderColor: 'var(--color-border)' }}>
+                <div className="min-w-0">
+                  <h2 className="text-lg font-black" style={{ color: 'var(--color-text-primary)' }}>Edit {roleLabel(permsTarget.role, rolesBySlug)} Permissions</h2>
+                  <p className="mt-1 truncate text-xs font-bold" style={{ color: 'var(--color-text-muted)' }}>
+                    Changes apply to {permsTarget.fullName} and all other {roleLabel(permsTarget.role, rolesBySlug)} users
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPermsTarget(null)}
+                  className="rounded-lg p-2 transition-colors hover:bg-[#F3F4F6]"
+                  style={{ color: 'var(--color-text-faint)' }}
+                  aria-label="Close permissions"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+              <div className="flex-1 overflow-y-auto p-6">
+                <CapabilityChecklist catalog={capabilityCatalog} selected={permsDraft} onToggle={togglePerm} />
+              </div>
+              <div className="flex items-center justify-end gap-3 border-t px-6 py-4" style={{ borderColor: 'var(--color-border)' }}>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setPermsTarget(null)}
+                    disabled={permsSaving}
+                    className="min-h-11 whitespace-nowrap rounded-xl border bg-white px-5 py-2.5 text-sm font-bold text-[#4B5563] transition-all hover:bg-[#F9FAFB] disabled:opacity-50"
+                    style={{ borderColor: 'var(--color-border)' }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => savePermissions()}
+                    disabled={permsSaving}
+                    className="inline-flex min-h-11 items-center justify-center gap-2 whitespace-nowrap rounded-xl bg-[#111827] px-6 py-2.5 text-sm font-black text-white shadow-lg transition-all hover:bg-[#374151] disabled:opacity-60"
+                  >
+                    {permsSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                    Save Role
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence mode="wait">
+        {showMissingDepartmentModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-[#111827]/40 p-4 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-2xl"
+            >
+              <div className="border-b border-[#E5E7EB] px-6 py-4">
+                <h2 className="text-lg font-black text-[#111827]">Add Department First</h2>
+              </div>
+              <div className="p-6">
+                <p className="text-sm text-[#4B5563]">
+                  You must add at least one department before you can register a new user account.
+                </p>
+                <div className="mt-6 flex justify-end gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setShowMissingDepartmentModal(false)}
+                    className="rounded-xl border border-[#D1D5DB] bg-white px-4 py-2.5 text-sm font-bold text-[#4B5563] transition-all hover:bg-[#F9FAFB] hover:text-[#111827]"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => navigate('/departments')}
+                    className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#111827] px-6 py-2.5 text-sm font-black text-white shadow-lg shadow-[#11182720] transition-all hover:bg-[#374151]"
+                  >
+                    Go to Departments
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {passwordEditUser && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/45 px-4 py-6 backdrop-blur-sm"
+            onClick={() => !isUpdatingPassword && setPasswordEditUser(null)}
+          >
+            <motion.div
+              initial={{ opacity: 0, y: 30, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 30, scale: 0.95 }}
+              transition={{ type: 'spring', stiffness: 380, damping: 30 }}
+              className="flex w-full max-w-md flex-col overflow-hidden rounded-2xl border bg-white shadow-2xl"
+              style={{ borderColor: 'var(--color-border)', backgroundColor: 'var(--color-surface)' }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start justify-between gap-4 border-b px-6 py-5" style={{ borderColor: 'var(--color-border)' }}>
+                <div className="min-w-0">
+                  <h2 className="text-lg font-black" style={{ color: 'var(--color-text-primary)' }}>Edit Password</h2>
+                  <p className="mt-1 truncate text-xs font-bold" style={{ color: 'var(--color-text-muted)' }}>
+                    {passwordEditUser.fullName || passwordEditUser.email}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => !isUpdatingPassword && setPasswordEditUser(null)}
+                  disabled={isUpdatingPassword}
+                  className="rounded-lg p-2 transition-colors hover:bg-[#F3F4F6] disabled:opacity-50"
+                  style={{ color: 'var(--color-text-faint)' }}
+                  aria-label="Close"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+              <div className="p-6">
+                <div className="space-y-4">
+                  <div>
+                    {/* Hidden username field to prevent browser autofill from hijacking the search bar */}
+                    <input 
+                      type="text" 
+                      name="username" 
+                      autoComplete="username" 
+                      value={passwordEditUser.email} 
+                      className="sr-only" 
+                      readOnly 
+                      tabIndex={-1} 
+                      aria-hidden="true" 
+                    />
+
+                    <label className="mb-1.5 block text-xs font-bold text-[#4B5563]">New Password</label>
+                    <div className="relative">
+                      <input
+                        type={showPassword ? 'text' : 'password'}
+                        name="new-password"
+                        autoComplete="new-password"
+                        value={newPassword}
+                        onChange={(e) => setNewPassword(e.target.value)}
+                        placeholder="Enter new password"
+                        className="w-full rounded-xl border border-[#E5E7EB] px-4 py-2.5 pr-10 text-sm transition-all focus:border-[#111827] focus:outline-none focus:ring-1 focus:ring-[#111827]"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword(!showPassword)}
+                        className="absolute inset-y-0 right-0 flex items-center pr-3 text-[#9CA3AF] transition-colors hover:text-[#4B5563]"
+                        tabIndex={-1}
+                        aria-label={showPassword ? 'Hide password' : 'Show password'}
+                      >
+                        {showPassword ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center justify-end gap-3 border-t px-6 py-4" style={{ borderColor: 'var(--color-border)' }}>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setPasswordEditUser(null)}
+                    disabled={isUpdatingPassword}
+                    className="min-h-11 whitespace-nowrap rounded-xl border bg-white px-5 py-2.5 text-sm font-bold text-[#4B5563] transition-all hover:bg-[#F9FAFB] disabled:opacity-50"
+                    style={{ borderColor: 'var(--color-border)' }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (!newPassword) {
+                        toast.error('Password is required');
+                        return;
+                      }
+
+                      const missingRules = PASSWORD_RULES.filter((rule) => !rule.test(newPassword)).map((rule) => rule.label.toLowerCase());
+                      if (missingRules.length > 0) {
+                        toast.error(`Password must include ${missingRules.join(', ')}.`);
+                        return;
+                      }
+                      setIsUpdatingPassword(true);
+                      try {
+                        await userService.updatePassword(passwordEditUser.uid, newPassword);
+                        toast.success('Password updated successfully');
+                        setPasswordEditUser(null);
+                        setNewPassword('');
+                      } catch (error: any) {
+                        toast.error(error.message || 'Unable to update password');
+                      } finally {
+                        setIsUpdatingPassword(false);
+                      }
+                    }}
+                    disabled={isUpdatingPassword || !newPassword || PASSWORD_RULES.some(rule => !rule.test(newPassword))}
+                    className="inline-flex min-h-11 items-center justify-center gap-2 whitespace-nowrap rounded-xl bg-[#111827] px-6 py-2.5 text-sm font-black text-white shadow-lg transition-all hover:bg-[#374151] disabled:opacity-60"
+                  >
+                    {isUpdatingPassword ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                    Save Password
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </PageLayout>
+  );
+}
+
+function SummaryCard({
+  label,
+  count,
+  icon: Icon,
+  color,
+  bg,
+}: {
+  label: string;
+  count: number;
+  icon: React.ComponentType<{ className?: string }>;
+  color: string;
+  bg: string;
+}) {
+  return (
+    <div className="p-6 rounded-2xl border border-[#E5E7EB] bg-white shadow-sm flex items-center justify-between">
+      <div className="flex items-center gap-4">
+        <div className={`p-3 rounded-xl ${bg} ${color}`}>
+          <Icon className="w-5 h-5" />
+        </div>
+        <div>
+          <h4 className="text-sm font-black text-[#111827]">{label}</h4>
+          <p className="text-xs text-[#6B7280] font-bold uppercase">{count} Total</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AnimatedSelect({
+  value,
+  onChange,
+  options,
+  disabled,
+  className,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  options: { value: string; label: string }[];
+  disabled?: boolean;
+  className?: string;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const selectedLabel = options.find((opt) => opt.value === value)?.label || 'Select...';
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    }
+    
+    if (isOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [isOpen]);
+
+  return (
+    <div ref={containerRef} className={`relative ${className || 'min-w-[140px]'}`}>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => setIsOpen((prev) => !prev)}
+        className="flex min-h-11 w-full items-center justify-between gap-3 rounded-xl border border-[#E5E7EB] bg-white px-3 py-2.5 text-left text-sm font-bold text-[#4B5563] outline-none transition-all hover:border-[#CBD5E1] hover:bg-[#F9FAFB] focus:ring-2 focus:ring-[#111827] disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        <span className="truncate">{selectedLabel}</span>
+        <ChevronRight
+          className={`h-4 w-4 shrink-0 transition-transform text-[#9CA3AF] ${isOpen ? 'rotate-90' : ''
+            }`}
+        />
+      </button>
+      <AnimatePresence>
+        {isOpen && (
+            <motion.div
+              initial={{ opacity: 0, y: -10, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -10, scale: 0.95 }}
+              transition={{ duration: 0.15, ease: 'easeOut' }}
+              className="absolute left-0 top-[calc(100%+8px)] z-20 overflow-hidden rounded-xl border border-[#E5E7EB] bg-white shadow-xl shadow-[#11182714] min-w-full w-max"
+            >
+              <div className="max-h-48 overflow-y-auto py-1">
+                {options.map((opt) => (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => {
+                      onChange(opt.value);
+                      setIsOpen(false);
+                    }}
+                    className={`w-full flex items-center justify-between gap-3 px-3 py-2 text-left transition-colors hover:bg-[#F3F4F6] ${value === opt.value ? 'bg-[#EFF6FF]' : ''
+                      }`}
+                  >
+                    <span className={`truncate text-sm font-semibold ${value === opt.value ? 'text-[#2563EB]' : 'text-[#4B5563]'}`}>{opt.label}</span>
+                    {value === opt.value && <CheckCircle2 className="h-4 w-4 shrink-0 text-[#2563EB]" />}
+                  </button>
+                ))}
+              </div>
+            </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function SortableHeader({
+  label,
+  sortKey,
+  currentSort,
+  onSort,
+  className,
+}: {
+  label: string;
+  sortKey: string;
+  currentSort: { key: string; direction: 'asc' | 'desc' } | null;
+  onSort: (key: string) => void;
+  className?: string;
+}) {
+  const isActiveSort = currentSort?.key === sortKey;
+  const SortIcon = isActiveSort ? (currentSort?.direction === 'asc' ? ArrowUp : ArrowDown) : ArrowUpDown;
+
+  return (
+    <th className={`h-14 px-6 py-0 text-[0.625rem] font-black text-[#9CA3AF] uppercase tracking-widest align-middle ${className || ''}`}>
+      <button
+        type="button"
+        onClick={() => onSort(sortKey)}
+        aria-sort={isActiveSort ? (currentSort?.direction === 'asc' ? 'ascending' : 'descending') : 'none'}
+        className={`flex max-w-full items-center gap-1.5 rounded-lg py-2 text-left uppercase tracking-widest transition-colors hover:text-[#111827] ${isActiveSort ? 'text-[#111827]' : ''
+          }`}
+      >
+        <span className="truncate">{label}</span>
+        <SortIcon className={`h-3.5 w-3.5 shrink-0 ${isActiveSort ? 'text-[#111827]' : 'text-[#9CA3AF]'}`} />
+      </button>
+    </th>
+  );
+}

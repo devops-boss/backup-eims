@@ -1,0 +1,108 @@
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { env } from './config/env.js';
+import authRoutes from './routes/auth.routes.js';
+import employeeRoutes from './routes/employee.routes.js';
+import deviceRoutes, { assignmentRouter } from './routes/device.routes.js';
+import siteRoutes from './routes/site.routes.js';
+import auditLogRoutes from './routes/auditLog.routes.js';
+import accountRoutes from './routes/account.routes.js';
+import userRoutes from './routes/user.routes.js';
+import roleRoutes from './routes/role.routes.js';
+import settingsRoutes from './routes/settings.routes.js';
+import employeeImportRoutes from './routes/employeeImport.routes.js';
+import notificationRoutes from './routes/notification.routes.js';
+import { authenticate, requirePermission } from './middleware/auth.middleware.js';
+import { errorHandler, notFound } from './middleware/error.middleware.js';
+
+const app = express();
+const localDevOriginPattern = /^http:\/\/(localhost|127\.0\.0\.1):30\d{2}$/;
+
+function resolveCorsOrigin(origin, callback) {
+  if (!origin) {
+    callback(null, true);
+    return;
+  }
+
+  if (env.corsOrigins.includes(origin) || env.nodeEnv === 'development') {
+    callback(null, true);
+    return;
+  }
+
+  callback(new Error(`Origin ${origin} is not allowed by CORS`));
+}
+
+import path from 'path';
+
+app.set('trust proxy', 1);
+app.use(
+  helmet({
+    crossOriginResourcePolicy: false,
+    hsts: false,
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'"],
+        // Allowed to connect to anything on the local network (http and https)
+        connectSrc: ["'self'", 'http://*', 'https://*'],
+        frameAncestors: ["'none'"]
+      }
+    },
+    frameguard: {
+      action: 'deny'
+    }
+  })
+);
+app.use(
+  cors({
+    origin: resolveCorsOrigin,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+
+// Prevent caching of any API responses to protect sensitive data
+app.use((req, res, next) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
+app.use(express.json({ limit: '50mb' }));
+app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5000, // Increased to support multiple employees on the same office network
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use('/api', apiLimiter);
+app.get('/health', (req, res) => {
+  if (req.query.socket_error) {
+    console.error(`[Frontend Socket Error] ${req.query.socket_error}`);
+  }
+  res.json({ success: true, message: 'API is healthy' });
+});
+app.use('/api/auth', authRoutes);
+app.use('/api/accounts', authenticate, accountRoutes);
+app.use('/api/employees', authenticate, employeeRoutes);
+app.use('/api/employee-imports', authenticate, employeeImportRoutes);
+app.use('/api/sites', authenticate, siteRoutes);
+app.use('/api/devices', authenticate, deviceRoutes);
+app.use('/api/device-assignments', authenticate, assignmentRouter);
+app.use('/api/audit-logs', authenticate, auditLogRoutes);
+app.use('/api/notifications', authenticate, notificationRoutes);
+app.use('/api/users', authenticate, requirePermission('users.manage'), userRoutes);
+app.use('/api/roles', authenticate, roleRoutes);
+app.use('/api/settings', authenticate, requirePermission('settings.manage'), settingsRoutes);
+
+app.use(notFound);
+app.use(errorHandler);
+
+export default app;
